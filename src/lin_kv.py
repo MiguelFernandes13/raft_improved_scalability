@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Simple 'echo' workload in Python for Maelstrom
+# https://raft.github.io/raft.pdf
 
 #run with
 # ./maelstrom test --bin ../uni/4ano/sd/tf/guiao3/lin_kv.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
@@ -36,26 +36,22 @@ currentTerm = 0
 votedFor = None
 log = []
 
-prevLogIndex = 0
-prevLogTerm = 0
-
-last_index = 1
 index = 1
 commitIndex = 0
 lastApplied = 0
 
-nextIndex = []
-matchIndex = []
+nextIndex = {}
+matchIndex = {}
 
 vote_count = 0
 
 lock_index = Lock()
-#Timer
+#Timers
 heartbeat_timeout = None
 election_timeout = None
 
 class Command:
-    def __init__(self, type, key, value, term, index, src, resp=0):
+    def __init__(self, type, key, value, term, index, src, resp=1):
         self.type = type
         self.key = key
         self.value = value
@@ -70,7 +66,7 @@ def broadcast(**kwds):
             send(node_id, i, **kwds)
 
 def request_vote():
-    global state, currentTerm, vote_count, votedFor, lastLogIndex, lastLogTerm, election_timeout
+    global state, currentTerm, vote_count, votedFor, election_timeout, log
     state = State.CANDIDATE
     currentTerm += 1
     vote_count = 1
@@ -83,48 +79,47 @@ def request_vote():
         lastLogTerm = log[lastLogIndex].term
     logging.debug('request vote')
     broadcast(type='request_vote', term=currentTerm, candidate_id=node_id, lastLogIndex= lastLogIndex, lastLogTerm=lastLogTerm)
-    election_timeout = Timer(0.3, reset_election)
+    random_timeout = random.randint(150, 300)
+    election_timeout = Timer(random_timeout/1000, request_vote)
     election_timeout.start()
 
 def wait_for_heartbeat():
     global heartbeat_timeout
     random_timeout = random.randint(150, 300)
-    logging.debug('wait for heartbeat %d', random_timeout)
     heartbeat_timeout = Timer(random_timeout/1000, request_vote)
     heartbeat_timeout.start()
 
 def send_heartbeat():
-    global last_index, prevLogIndex, prevLogTerm, commitIndex, state
+    global commitIndex, state, log, currentTerm
     while state == State.LEADER:
-        if index > last_index:
-            broadcast(type='log_replication', term=currentTerm, leader_id=node_id,
-                        prevLogIndex=prevLogIndex, prevLogTerm = prevLogTerm,
-                        entries=log[(last_index-1):], leadercommit=commitIndex)
-            last_index = index
-            prevLogIndex = index - 1
-            prevLogTerm = currentTerm
-            commitIndex += 1
-        else:
-            broadcast(type='heartbeat', term=currentTerm, leader_id=node_id,
-                        prevLogIndex=prevLogIndex, prevLogTerm = prevLogTerm,
-                        entries=[], leadercommit=commitIndex)
+        for i in node_ids:
+            if i != node_id:
+                if len(log) == 0 or nextIndex[i] == 0:
+                    prevLogIndex = 0
+                    prevLogTerm = 0
+                else:
+                    prevLogIndex = nextIndex[i] - 1
+                    prevLogTerm = log[prevLogIndex].term
+                if nextIndex[i] < len(log):
+                    send(node_id, i, type='log_replication', term=currentTerm,
+                            leader_id=node_id, prevLogIndex=prevLogIndex,
+                            prevLogTerm = prevLogTerm, entries=log[nextIndex[i]:],
+                            leadercommit=commitIndex)
+                else:
+                    send(node_id, i, type='heartbeat', term=currentTerm, leader_id=node_id,
+                            prevLogIndex=prevLogIndex, prevLogTerm = prevLogTerm, entries=[], leadercommit=commitIndex)
         time.sleep(0.07)
-
-def reset_election():
-    global state, vote_count, votedFor, currentTerm
-    state = State.FOLLOWER
-    vote_count = 0
-    votedFor = None
-    currentTerm -=1
-    wait_for_heartbeat()
-
 
 # Reply false if term < currentTerm
 def verify_term(msg):
     global currentTerm
-    if msg.body.term < currentTerm:
+    if msg.body.term > currentTerm:
+        currentTerm = msg.body.term
+        return True
+    elif msg.body.term < currentTerm:
         return False
-    return True
+    else:
+        return True
 
 #Reply false if log doesn’t contain an entry at prevLogIndex
 #whose term matches prevLogTerm
@@ -138,24 +133,43 @@ def verify_prevLogIndex(msg):
     return False
 
 def verify_heartbeat(msg):
-    global commitIndex, log
-    if verify_term(msg) and verify_prevLogIndex(msg):
-        # If an existing entry conflicts with a new one (same index
-        #but different terms), delete the existing entry and all that
-        #follow it 
-        for i in range(msg.body.prevLogIndex + 1, len(log)):
-            if i < len(log) and log[i].term != msg.body.term:
-                log = log[:i]
-                break
-        # Append any new entries not already in the log
-        for entry in msg.body.entries:
-            if entry not in log:
-                log.append(entry)
-        #If leaderCommit > commitIndex, set commitIndex =
-        #min(leaderCommit, index of last new entry)
-        if msg.body.leadercommit > commitIndex:
-            commitIndex = min(msg.body.leadercommit, len(log)-1)
-        return True
+    global commitIndex, log, state, heartbeat_timeout, election_timeout, currentTerm, votedFor, lastApplied
+    if verify_term(msg):
+        logging.info('term verified')
+        #reset heartbeat timeout
+        heartbeat_timeout.cancel()
+        # another server establishes itself as leader
+        if state == State.CANDIDATE:
+            election_timeout.cancel()
+            state = State.FOLLOWER
+            votedFor = None
+        elif state == State.LEADER:
+            state = State.FOLLOWER
+            votedFor = None
+       
+        if verify_prevLogIndex(msg):
+            logging.info('prevLogIndex verified')
+            # If an existing entry conflicts with a new one (same index
+            #but different terms), delete the existing entry and all that
+            #follow it 
+            for i in range(msg.body.prevLogIndex + 1, len(log)):
+                if i < len(log) and log[i].term != msg.body.term:
+                    log = log[:i]
+                    break
+            # Append any new entries not already in the log
+            for entry in msg.body.entries:
+                if entry not in log:
+                    log.append(entry)
+            #If leaderCommit > commitIndex, set commitIndex =
+            #min(leaderCommit, index of last new entry)
+            if msg.body.leadercommit > commitIndex:
+                logging.info('commitIndex updated from %s to %s', commitIndex, min(msg.body.leadercommit, len(log)))
+                commitIndex = min(msg.body.leadercommit, len(log))
+                for i in range(lastApplied, commitIndex ):
+                    logging.info('commit %s %s', log[i].key, log[i].value)
+                    linkv[log[i].key] = log[i].value
+                lastApplied = commitIndex
+            return True
     return False
 
 def send_error_not_leader(msg):
@@ -167,11 +181,14 @@ for msg in receiveAll():
     if msg.body.type == 'init':
         node_id = msg.body.node_id
         node_ids = msg.body.node_ids
-        logging.info('node %s initialized', node_id)
         state = State.FOLLOWER
+        for i in node_ids:
+            nextIndex[i] = 0
+            matchIndex[i] = 0
         wait_for_heartbeat()
-
+        logging.info('node %s initialized', node_id)
         reply(msg, type='init_ok')
+
     elif msg.body.type == 'read':
         if state == State.LEADER:
             if msg.body.key in linkv:
@@ -199,8 +216,8 @@ for msg in receiveAll():
         logging.info('cas %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                if msg.body.value == linkv[msg.body.key]:
-                    c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg.src)
+                if getattr(msg.body, "from") == linkv[msg.body.key]:
+                    c = Command('write', msg.body.key, msg.body.to, currentTerm, index, msg.src)
                     index += 1
                     log.append(c)
                 else:
@@ -218,45 +235,38 @@ for msg in receiveAll():
 
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
-        # another server establishes itself as leader
-        if state == State.CANDIDATE:
-            election_timeout.cancel()
-            state = State.FOLLOWER
-            votedFor = None
-        
-        heartbeat_timeout.cancel()
 
         if verify_heartbeat(msg):
             reply(msg, type='log_replication_resp', success=True, term=currentTerm)
-            for entry in msg.body.entries:
-                if entry.type == 'update':
-                    linkv[entry.key] = entry.value
+            wait_for_heartbeat()
         else:
             reply(msg, type='log_replication_resp', success=False, term=currentTerm)
-        wait_for_heartbeat()
 
 
     elif msg.body.type == 'log_replication_resp':
         logging.info('log replication response')
         if msg.body.success == True:
-            request = log[len(log)-1]
-            request.resp += 1
-            #If there a majority of replicas responses, apply the command to the state machine
-            if request.resp > (len(node_ids)//2) - 1:
-                linkv[request.key] = request.value
-                send(node_id, request.src, type='write_ok')
-                c = Command('update', request.key, request.value, currentTerm, lastApplied, None)
-                index += 1
-                log.append(c)
-                lastApplied += 1
-                request.resp = 0
+            requests = log[nextIndex[msg.src]:]
+            nextIndex[msg.src] += len(requests)
+            matchIndex[msg.src] = nextIndex[msg.src] - 1
+            for request in requests:
+                request.resp += 1
+                #If there a majority of replicas responses, apply the command to the state machine
+                if request.resp > (len(node_ids)//2):
+                    linkv[request.key] = request.value
+                    lastApplied += 1
+                    commitIndex += 1
+                    request.resp = -1
+                    send(node_id, request.src, type='write_ok')
+        else:
+            nextIndex[msg.src] -= 1
 
     elif msg.body.type == 'request_vote':
         logging.info('request vote')
         if state != State.LEADER:
             heartbeat_timeout.cancel()
         #Reply false if term < currentTerm
-        if verify_term(msg) and (votedFor == None or votedFor == msg.body.candidate_id) and msg.body.lastLogIndex >= len(log)-1:
+        if msg.body.term >= currentTerm and (votedFor == None or votedFor == msg.body.candidate_id) and msg.body.lastLogIndex >= len(log)-1:
             votedFor = msg.body.candidate_id
             currentTerm = msg.body.term
             reply(msg, type='request_vote_resp', vote_granted=True, term=currentTerm)
@@ -275,14 +285,13 @@ for msg in receiveAll():
                 state = State.LEADER
                 votedFor = None
                 vote_count = 0
+                for i in node_ids:
+                    nextIndex[i] = len(log)
+                    matchIndex[i] = 0
                 Thread(target=send_heartbeat).start()
                 logging.info('leader elected')
 
     elif msg.body.type == 'heartbeat':
         logging.info('heartbeat')
-        if state == State.CANDIDATE:
-            election_timeout.cancel()
-            state = State.FOLLOWER
-            votedFor = None
-        heartbeat_timeout.cancel()
-        wait_for_heartbeat()
+        if verify_heartbeat(msg):
+            wait_for_heartbeat()
