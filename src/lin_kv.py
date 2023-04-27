@@ -125,7 +125,7 @@ def verify_term(msg):
 #whose term matches prevLogTerm
 def verify_prevLogIndex(msg):
     global log
-    if len(log) == 0:
+    if len(log) == 0 or msg.body.prevLogIndex == 0:
         return True
     elif (msg.body.prevLogIndex - 1) < len(log):
         if log[(msg.body.prevLogIndex - 1)].term == msg.body.prevLogTerm:
@@ -158,7 +158,7 @@ def verify_heartbeat(msg):
                     break
             # Append any new entries not already in the log
             for entry in msg.body.entries:
-                if entry not in log:
+                if entry.index > len(log):
                     log.append(entry)
             #If leaderCommit > commitIndex, set commitIndex =
             #min(leaderCommit, index of last new entry)
@@ -248,16 +248,25 @@ for msg in receiveAll():
         if msg.body.success == True:
             requests = log[nextIndex[msg.src]:]
             nextIndex[msg.src] += len(requests)
-            matchIndex[msg.src] = nextIndex[msg.src] - 1
+            matchIndex[msg.src] = nextIndex[msg.src]
             for request in requests:
-                request.resp += 1
+                majority = 0
+                for node in node_ids:
+                    logging.info('matchIndex %s %s', node, matchIndex[node])
+                    if matchIndex[node] >= request.index:
+                        majority += 1
+                #request.resp += 1
                 #If there a majority of replicas responses, apply the command to the state machine
-                if request.resp > (len(node_ids)//2):
+                #if request.resp > (len(node_ids)//2):
+                if majority > (len(node_ids)//2):
+                    logging.info('commit %s %s', request.key, request.value)
                     linkv[request.key] = request.value
                     lastApplied += 1
                     commitIndex += 1
                     request.resp = -1
                     send(node_id, request.src, type='write_ok')
+                else:
+                    break        
         else:
             nextIndex[msg.src] -= 1
 
@@ -281,6 +290,7 @@ for msg in receiveAll():
         if msg.body.vote_granted == True:
             vote_count += 1
             if vote_count > (len(node_ids)//2):
+                heartbeat_timeout.cancel()
                 election_timeout.cancel()
                 state = State.LEADER
                 votedFor = None
