@@ -3,7 +3,7 @@
 # https://raft.github.io/raft.pdf
 
 #run with
-# ./maelstrom test --bin ../uni/4ano/sd/tf/guiao3/lin_kv.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
+# ./maelstrom test --bin ../uni/4ano/sd/tf/raft_improved_scalability/src/lin_kv.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
 
 
 #Log replication
@@ -67,21 +67,22 @@ def broadcast(**kwds):
 
 def request_vote():
     global state, currentTerm, vote_count, votedFor, election_timeout, log
-    state = State.CANDIDATE
-    currentTerm += 1
-    vote_count = 1
-    votedFor = node_id
-    if len(log) == 0:
-        lastLogIndex = 0
-        lastLogTerm = 0
-    else:
-        lastLogIndex = len(log) - 1
-        lastLogTerm = log[lastLogIndex].term
-    logging.debug('request vote')
-    broadcast(type='request_vote', term=currentTerm, candidate_id=node_id, lastLogIndex= lastLogIndex, lastLogTerm=lastLogTerm)
-    random_timeout = random.randint(150, 300)
-    election_timeout = Timer(random_timeout/1000, request_vote)
-    election_timeout.start()
+    if state != State.LEADER:
+        logging.info('request vote')
+        state = State.CANDIDATE
+        currentTerm += 1
+        vote_count = 1
+        votedFor = node_id
+        if len(log) == 0:
+            lastLogIndex = 0
+            lastLogTerm = 0
+        else:
+            lastLogIndex = len(log)
+            lastLogTerm = log[lastLogIndex - 1].term
+        broadcast(type='request_vote', term=currentTerm, candidate_id=node_id, lastLogIndex= lastLogIndex, lastLogTerm=lastLogTerm)
+        random_timeout = random.randint(150, 300)
+        election_timeout = Timer(random_timeout/1000, request_vote)
+        election_timeout.start()
 
 def wait_for_heartbeat():
     global heartbeat_timeout
@@ -112,9 +113,14 @@ def send_heartbeat():
 
 # Reply false if term < currentTerm
 def verify_term(msg):
-    global currentTerm
+    global currentTerm, votedFor, state
     if msg.body.term > currentTerm:
         currentTerm = msg.body.term
+        if state != State.FOLLOWER:
+            state = State.FOLLOWER
+            votedFor = None
+            if state == State.CANDIDATE:
+                election_timeout.cancel()
         return True
     elif msg.body.term < currentTerm:
         return False
@@ -138,14 +144,6 @@ def verify_heartbeat(msg):
         logging.info('term verified')
         #reset heartbeat timeout
         heartbeat_timeout.cancel()
-        # another server establishes itself as leader
-        if state == State.CANDIDATE:
-            election_timeout.cancel()
-            state = State.FOLLOWER
-            votedFor = None
-        elif state == State.LEADER:
-            state = State.FOLLOWER
-            votedFor = None
        
         if verify_prevLogIndex(msg):
             logging.info('prevLogIndex verified')
@@ -258,15 +256,19 @@ for msg in receiveAll():
                 #request.resp += 1
                 #If there a majority of replicas responses, apply the command to the state machine
                 #if request.resp > (len(node_ids)//2):
-                if majority > (len(node_ids)//2):
+                if majority == (len(node_ids)//2) + 1:
                     logging.info('commit %s %s', request.key, request.value)
                     linkv[request.key] = request.value
                     lastApplied += 1
                     commitIndex += 1
-                    request.resp = -1
                     send(node_id, request.src, type='write_ok')
                 else:
-                    break        
+                    break 
+        elif msg.body.term > currentTerm:
+            currentTerm = msg.body.term
+            state = State.FOLLOWER
+            votedFor = None
+            wait_for_heartbeat()    
         else:
             nextIndex[msg.src] -= 1
 
@@ -275,10 +277,18 @@ for msg in receiveAll():
         if state != State.LEADER:
             heartbeat_timeout.cancel()
         #Reply false if term < currentTerm
-        if msg.body.term >= currentTerm and (votedFor == None or votedFor == msg.body.candidate_id) and msg.body.lastLogIndex >= len(log)-1:
-            votedFor = msg.body.candidate_id
+        if (msg.body.term > currentTerm):
             currentTerm = msg.body.term
-            reply(msg, type='request_vote_resp', vote_granted=True, term=currentTerm)
+            state = State.FOLLOWER
+            votedFor = None
+            if (msg.body.lastLogIndex > len(log)-1):
+                votedFor = msg.body.candidate_id
+                reply(msg, type='request_vote_resp', vote_granted=True, term=currentTerm)
+            else:
+                reply(msg, type='request_vote_resp', vote_granted=False, term=currentTerm)
+        elif (msg.body.term == currentTerm) and (votedFor == None or votedFor == msg.body.candidate_id) and (msg.body.lastLogIndex > len(log)-1):
+                votedFor = msg.body.candidate_id
+                reply(msg, type='request_vote_resp', vote_granted=True, term=currentTerm)
         else:
             reply(msg, type='request_vote_resp', vote_granted=False, term=currentTerm)
         if state != State.LEADER:
@@ -287,19 +297,24 @@ for msg in receiveAll():
 
     elif msg.body.type == 'request_vote_resp':
         logging.info('request vote response')
-        if msg.body.vote_granted == True:
+        if msg.body.vote_granted == True and state == State.CANDIDATE:
             vote_count += 1
             if vote_count > (len(node_ids)//2):
                 heartbeat_timeout.cancel()
                 election_timeout.cancel()
                 state = State.LEADER
                 votedFor = None
-                vote_count = 0
                 for i in node_ids:
                     nextIndex[i] = len(log)
                     matchIndex[i] = 0
                 Thread(target=send_heartbeat).start()
                 logging.info('leader elected')
+        elif msg.body.term > currentTerm:
+            currentTerm = msg.body.term
+            state = State.FOLLOWER
+            election_timeout.cancel()
+            votedFor = None
+            wait_for_heartbeat()
 
     elif msg.body.type == 'heartbeat':
         logging.info('heartbeat')
