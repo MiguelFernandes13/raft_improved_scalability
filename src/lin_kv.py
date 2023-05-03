@@ -170,9 +170,15 @@ def verify_heartbeat(msg):
             return True
     return False
 
-def send_error_not_leader(msg):
-    msg.body.code = '11'
-    msg.body.text = 'Not leader'
+
+#def send_error_not_leader(msg):
+#    msg.body.code = '11'
+#    msg.body.text = 'Not leader'
+#    reply(msg, type='error')
+    
+def send_error(msg, code, text):
+    msg.body.code = code
+    msg.body.text = text
     reply(msg, type='error')
     
 for msg in receiveAll():
@@ -194,12 +200,10 @@ for msg in receiveAll():
                 reply(msg, type='read_ok', value=linkv[msg.body.key])
 
             else:
-                msg.body.code = '20'
-                msg.body.text = 'Key not found'
-                reply(msg, type='error')
+                send_error(msg, '20', 'Key not found')
                 logging.warning('value not found for key %s', msg.body.key)
         else:
-            send_error_not_leader(msg)
+            send_error(msg, '11', 'Not leader')
 
     elif msg.body.type == 'write':
         logging.info('write %s', msg.body.key)
@@ -208,7 +212,7 @@ for msg in receiveAll():
             index += 1
             log.append(c)       
         else:
-            send_error_not_leader(msg)
+            send_error(msg, '11', 'Not leader')
         
     elif msg.body.type == 'cas':
         logging.info('cas %s', msg.body.key)
@@ -219,17 +223,13 @@ for msg in receiveAll():
                     index += 1
                     log.append(c)
                 else:
-                    msg.body.code = '22'
-                    msg.body.text = 'From value does not match key'
-                    reply(msg, type='error')
+                    send_error(msg, '22', 'From value does not match key')
                     logging.warning('from does not match value for key %s', msg.body.key)
             else:
-                msg.body.code = '21'
-                msg.body.text = 'Key not found'
-                reply(msg, type='error')
+                send_error(msg, '21', 'Key not found')
                 logging.warning('value not found for key %s', msg.body.key)
         else:
-            send_error_not_leader(msg)
+            send_error(msg, '11', 'Not leader')
 
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
