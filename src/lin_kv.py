@@ -36,7 +36,6 @@ currentTerm = 0
 votedFor = None
 log = []
 
-index = 1
 commitIndex = 0
 lastApplied = 0
 
@@ -99,39 +98,41 @@ def send_heartbeat():
                     prevLogIndex = 0
                     prevLogTerm = 0
                 else:
-                    prevLogIndex = nextIndex[i] - 1
-                    prevLogTerm = log[prevLogIndex].term
+                    prevLogIndex = nextIndex[i]
+                    prevLogTerm = log[prevLogIndex - 1].term
+                logging.info('nextIndex: ' + str(nextIndex[i]) + ' len(log): ' + str(len(log)))
                 if nextIndex[i] < len(log):
+                    logging.info('sending log_replication with entries')
                     send(node_id, i, type='log_replication', term=currentTerm,
                             leader_id=node_id, prevLogIndex=prevLogIndex,
                             prevLogTerm = prevLogTerm, entries=log[nextIndex[i]:],
                             leadercommit=commitIndex)
                 else:
-                    send(node_id, i, type='heartbeat', term=currentTerm, leader_id=node_id,
+                    logging.info('sending log_replication without entries')
+                    send(node_id, i, type='log_replication', term=currentTerm, leader_id=node_id,
                             prevLogIndex=prevLogIndex, prevLogTerm = prevLogTerm, entries=[], leadercommit=commitIndex)
         time.sleep(0.07)
 
 # Reply false if term < currentTerm
 def verify_term(msg):
     global currentTerm, votedFor, state
-    if msg.body.term > currentTerm:
+    if msg.body.term >= currentTerm:
         currentTerm = msg.body.term
         if state != State.FOLLOWER:
+            if state == State.CANDIDATE:
+                logging.info('cancel new election timeout')
+                election_timeout.cancel()
             state = State.FOLLOWER
             votedFor = None
-            if state == State.CANDIDATE:
-                election_timeout.cancel()
         return True
     elif msg.body.term < currentTerm:
         return False
-    else:
-        return True
 
 #Reply false if log doesn’t contain an entry at prevLogIndex
 #whose term matches prevLogTerm
 def verify_prevLogIndex(msg):
     global log
-    if len(log) == 0 or msg.body.prevLogIndex == 0:
+    if len(log) == 0 and msg.body.prevLogIndex == 0:
         return True
     elif (msg.body.prevLogIndex - 1) < len(log):
         if log[(msg.body.prevLogIndex - 1)].term == msg.body.prevLogTerm:
@@ -208,9 +209,10 @@ for msg in receiveAll():
     elif msg.body.type == 'write':
         logging.info('write %s', msg.body.key)
         if state == State.LEADER:
+            index = len(log) + 1
             c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg.src)
-            index += 1
             log.append(c)       
+            matchIndex[node_id] = index
         else:
             send_error(msg, '11', 'Not leader')
         
@@ -219,9 +221,10 @@ for msg in receiveAll():
         if state == State.LEADER:
             if msg.body.key in linkv:
                 if getattr(msg.body, "from") == linkv[msg.body.key]:
+                    index = len(log) + 1
                     c = Command('write', msg.body.key, msg.body.to, currentTerm, index, msg.src)
-                    index += 1
                     log.append(c)
+                    matchIndex[node_id] = index
                 else:
                     send_error(msg, '22', 'From value does not match key')
                     logging.warning('from does not match value for key %s', msg.body.key)
@@ -234,12 +237,14 @@ for msg in receiveAll():
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
 
-        if verify_heartbeat(msg):
+        if currentTerm > msg.body.term:
+            reply(msg, type='log_replication_resp', success=False, term=currentTerm)
+        elif verify_heartbeat(msg):
             reply(msg, type='log_replication_resp', success=True, term=currentTerm)
             wait_for_heartbeat()
         else:
-            reply(msg, type='log_replication_resp', success=False, term=currentTerm)
-
+            reply(msg, type='log_replication_resp', success=False, term=msg.body.term)
+            wait_for_heartbeat()
 
     elif msg.body.type == 'log_replication_resp':
         logging.info('log replication response')
@@ -274,11 +279,15 @@ for msg in receiveAll():
 
     elif msg.body.type == 'request_vote':
         logging.info('request vote')
-        if state != State.LEADER:
-            heartbeat_timeout.cancel()
+            
         #Reply false if term < currentTerm
         if (msg.body.term > currentTerm):
             currentTerm = msg.body.term
+            if state != State.LEADER:
+                heartbeat_timeout.cancel()
+                if state == State.CANDIDATE:
+                    logging.info('cancel election timeout')
+                    election_timeout.cancel()
             state = State.FOLLOWER
             votedFor = None
             if (msg.body.lastLogIndex > len(log)-1):
@@ -297,7 +306,7 @@ for msg in receiveAll():
 
     elif msg.body.type == 'request_vote_resp':
         logging.info('request vote response')
-        if msg.body.vote_granted == True and state == State.CANDIDATE:
+        if currentTerm == msg.body.term and msg.body.vote_granted == True and state == State.CANDIDATE:
             vote_count += 1
             if vote_count > (len(node_ids)//2):
                 heartbeat_timeout.cancel()
@@ -307,16 +316,11 @@ for msg in receiveAll():
                 for i in node_ids:
                     nextIndex[i] = len(log)
                     matchIndex[i] = 0
-                Thread(target=send_heartbeat).start()
                 logging.info('leader elected')
+                Thread(target=send_heartbeat).start()
         elif msg.body.term > currentTerm:
             currentTerm = msg.body.term
             state = State.FOLLOWER
             election_timeout.cancel()
             votedFor = None
-            wait_for_heartbeat()
-
-    elif msg.body.type == 'heartbeat':
-        logging.info('heartbeat')
-        if verify_heartbeat(msg):
             wait_for_heartbeat()
