@@ -3,7 +3,7 @@
 # https://raft.github.io/raft.pdf
 
 #run with
-# ./maelstrom test --bin ../uni/4ano/sd/tf/raft_improved_scalability/src/lin_kv.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
+# ./maelstrom test --bin ../uni/4ano/sd/tf/raft_improved_scalability/src/raft_improved_scalability.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
 
 
 #Log replication
@@ -31,6 +31,8 @@ class State(enum.Enum):
 logging.getLogger().setLevel(logging.DEBUG)
 linkv = {}
 
+read_log = {}
+
 state = None
 currentTerm = 0
 currentLeader = None
@@ -49,6 +51,7 @@ lock_index = Lock()
 #Timers
 heartbeat_timeout = None
 election_timeout = None
+read_quorum_timeout = None
 
 class Command:
     def __init__(self, type, key, value, term, index, src, resp=1):
@@ -122,7 +125,6 @@ def verify_term(msg):
         if msg.body.term > currentTerm:
             become_follower(msg)
         else:
-            logging.info('heartbeat timeout cancelled')
             heartbeat_timeout.cancel()
         return True
     return False
@@ -164,7 +166,7 @@ def verify_heartbeat(msg):
                 commitIndex = min(msg.body.leadercommit, len(log))
                 for i in range(lastApplied, commitIndex ):
                     logging.info('commit %s %s', log[i].key, log[i].value)
-                    linkv[log[i].key] = log[i].value
+                    linkv[log[i].key] = (log[i].value, log[i].index)
                 lastApplied = commitIndex
             return True
     return False
@@ -191,7 +193,6 @@ def create_command(msg):
 def become_follower(msg):
     global state, votedFor, currentTerm, heartbeat_timeout, election_timeout
     if state != State.LEADER:
-        logging.info('heartbeat timeout cancelled')
         heartbeat_timeout.cancel()
         if state == State.CANDIDATE:
             logging.info('cancel election timeout')
@@ -200,6 +201,24 @@ def become_follower(msg):
     votedFor = None
     currentTerm = msg.body.term
     
+def send_read_quorum(msg, read_id):
+    global read_log, read_quorum_timeout, node_ids, node_id
+    read_id += 1
+    #random selection approach
+    all_possible_nodes = list(node_ids)
+    all_possible_nodes.remove(node_id)
+    all_possible_nodes.remove(currentLeader)
+    quorum = random.sample(all_possible_nodes, (len(all_possible_nodes) // 2) + 1)
+    if msg.body.key in linkv:
+        read_log[read_id] = [msg.body.key, linkv[msg.body.key][0], linkv[msg.body.key][1], 1, msg.src]
+    else:
+        read_log[read_id] = [msg.body.key, None, -1, 1, msg.src]
+    for node in quorum:
+        send(node_id, node, type='read_quorum', key=msg.body.key, read_id=read_id)
+    logging.info('start read quorum timeout')
+    read_quorum_timeout = Timer(0.09, send_read_quorum, [msg, read_id])
+    read_quorum_timeout.start()
+
     
 for msg in receiveAll():
     if msg.body.type == 'init':
@@ -214,26 +233,53 @@ for msg in receiveAll():
         reply(msg, type='init_ok')
 
     elif msg.body.type == 'read':
-        logging.info('read %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                #check if msg.body has attribute client
-                if hasattr(msg.body, "client"): 
-                    send(node_id, msg.body.client, type='read_ok', value=linkv[msg.body.key])
-                else:
-                    reply(msg, type='read_ok', value=linkv[msg.body.key])
+                logging.info('read %s', msg.body.key)
+                reply(msg, type='read_ok', value=linkv[msg.body.key][0])
 
             else:
-                if hasattr(msg.body, "client"): 
-                    msg.src = msg.body.client
                 send_error(msg, '20', 'Key not found')
                 logging.warning('value not found for key %s', msg.body.key)
         else:
-            if currentLeader:
-                send(node_id, currentLeader, type='read', key=msg.body.key, client=msg.src)
-            else:
-                send_error(msg, '11', 'Not leader')
+           send_read_quorum(msg, msg.id)
 
+    elif msg.body.type == 'read_quorum':
+        logging.info('read_quorum %s', msg.body.key)
+        replied = False
+        for entries in reversed(log[lastApplied:]):
+            logging.info('read_quorum %s %s', entries.key, entries.index)
+            if entries.key == msg.body.key:
+                reply(msg, type='read_quorum_resp', sucess = True, timestamp=entries.index, read_id = msg.body.read_id)
+                replied = True
+                break
+        if not replied:
+            if msg.body.key in linkv:
+                reply(msg, type='read_quorum_resp', sucess = True, data=linkv[msg.body.key][0], timestamp=linkv[msg.body.key][1], read_id = msg.body.read_id)
+                replied = True
+        if not replied:
+            reply(msg, type='read_quorum_resp', sucess=False, read_id = msg.body.read_id)
+        
+    elif msg.body.type == 'read_quorum_resp':
+        if msg.body.read_id in read_log:
+            read_log[msg.body.read_id][3] += 1
+            if msg.body.sucess:
+                if read_log[msg.body.read_id][2] < msg.body.timestamp:
+                    if hasattr(msg.body, 'data'):
+                        read_log[msg.body.read_id][1] = msg.body.data
+                    else:
+                        read_log[msg.body.read_id][1] = None
+                    read_log[msg.body.read_id][2] = msg.body.timestamp
+            logging.info('read count %s', read_log[msg.body.read_id][3])
+            if read_log[msg.body.read_id][3] == (len(node_ids)//2)+1:
+                if read_log[msg.body.read_id][1] != None:
+                    read_quorum_timeout.cancel()
+                    send(node_id, read_log[msg.body.read_id][4], type='read_ok', value=read_log[msg.body.read_id][1])
+                elif read_log[msg.body.read_id][2] == -1:
+                    read_quorum_timeout.cancel()
+                    msg.src = read_log[msg.body.read_id][4]
+                    send_error(msg, '20', 'Key not found')
+                del read_log[msg.body.read_id]     
 
     elif msg.body.type == 'write':
         logging.info('write %s', msg.body.key)
@@ -249,7 +295,7 @@ for msg in receiveAll():
         logging.info('cas %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                if getattr(msg.body, "from") == linkv[msg.body.key]:
+                if getattr(msg.body, "from") == linkv[msg.body.key][0]:
                     create_command(msg)
                 else:
                     send_error(msg, '22', 'From value does not match key')
@@ -284,7 +330,7 @@ for msg in receiveAll():
                 #if request.resp > (len(node_ids)//2):
                 if majority == (len(node_ids)//2) + 1:
                     logging.info('commit %s %s', request.key, request.value)
-                    linkv[request.key] = request.value
+                    linkv[request.key] = (request.value, request.index)
                     lastApplied += 1
                     commitIndex += 1
                     send(node_id, request.src, type='write_ok')
