@@ -309,14 +309,14 @@ for msg in receiveAll():
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
         if verify_heartbeat(msg):
-            reply(msg, type='log_replication_resp', success=True, term=currentTerm)
+            reply(msg, type='log_replication_resp', success=True, term=currentTerm, matchIndex=len(log))
         else:
             reply(msg, type='log_replication_resp', success=False, term=msg.body.term)
 
     elif msg.body.type == 'log_replication_resp':
         logging.info('log replication response')
         if msg.body.success == True:
-            requests = log[nextIndex[msg.src]:]
+            requests = log[nextIndex[msg.src]:msg.body.matchIndex]
             nextIndex[msg.src] += len(requests)
             matchIndex[msg.src] = nextIndex[msg.src]
             for request in requests:
