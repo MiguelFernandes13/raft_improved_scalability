@@ -3,7 +3,7 @@
 # https://raft.github.io/raft.pdf
 
 #run with
-# ./maelstrom test --bin ../uni/4ano/sd/tf/raft_improved_scalability/src/lin_kv.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
+# ./maelstrom test --bin ../uni/4ano/sd/tf/raft_improved_scalability/src/raft.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
 
 
 #Log replication
@@ -31,6 +31,8 @@ class State(enum.Enum):
 logging.getLogger().setLevel(logging.DEBUG)
 linkv = {}
 
+number_reads = 0
+number_reads_responses = 0
 state = None
 currentTerm = 0
 currentLeader = None
@@ -51,14 +53,13 @@ heartbeat_timeout = None
 election_timeout = None
 
 class Command:
-    def __init__(self, type, key, value, term, index, src, resp=1):
+    def __init__(self, type, key, value, term, index, src):
         self.type = type
         self.key = key
         self.value = value
         self.term = term
         self.index = index
         self.src = src
-        self.resp = resp
 
 def broadcast(**kwds):
     for i in node_ids:
@@ -215,13 +216,17 @@ for msg in receiveAll():
 
     elif msg.body.type == 'read':
         logging.info('read %s', msg.body.key)
+        number_reads += 1
         if state == State.LEADER:
             if msg.body.key in linkv:
                 #check if msg.body has attribute client
                 if hasattr(msg.body, "client"): 
+                    number_reads_responses += 1
                     send(node_id, msg.body.client, type='read_ok', value=linkv[msg.body.key])
                 else:
+                    number_reads_responses += 1
                     reply(msg, type='read_ok', value=linkv[msg.body.key])
+                logging.info('number of read responses %s of %s', number_reads_responses, number_reads)
 
             else:
                 if hasattr(msg.body, "client"): 
@@ -249,16 +254,23 @@ for msg in receiveAll():
         logging.info('cas %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                if getattr(msg.body, "from") == linkv[msg.body.key]:
+                if (hasattr(msg.body, "from") and getattr(msg.body, "from") == linkv[msg.body.key]) or (hasattr(msg.body, "ffrom") and getattr(msg.body, "ffrom") == linkv[msg.body.key]): 
                     create_command(msg)
                 else:
+                    if hasattr(msg.body, "client"):
+                        msg.src = msg.body.client
                     send_error(msg, '22', 'From value does not match key')
                     logging.warning('from does not match value for key %s', msg.body.key)
             else:
+                if hasattr(msg.body, "client"):
+                    msg.src = msg.body.client
                 send_error(msg, '21', 'Key not found')
                 logging.warning('value not found for key %s', msg.body.key)
         else:
-            send_error(msg, '11', 'Not leader')
+            if currentLeader and hasattr(msg.body, "from"):
+                send(node_id, currentLeader, type='cas', key=msg.body.key, ffrom = getattr(msg.body, "from"),to=msg.body.to, client=msg.src)
+            else:
+                send_error(msg, '11', 'Not leader')
 
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
@@ -279,15 +291,16 @@ for msg in receiveAll():
                     logging.info('matchIndex %s %s', node, matchIndex[node])
                     if matchIndex[node] >= request.index:
                         majority += 1
-                #request.resp += 1
                 #If there a majority of replicas responses, apply the command to the state machine
-                #if request.resp > (len(node_ids)//2):
                 if majority == (len(node_ids)//2) + 1:
                     logging.info('commit %s %s', request.key, request.value)
                     linkv[request.key] = request.value
                     lastApplied += 1
                     commitIndex += 1
-                    send(node_id, request.src, type='write_ok')
+                    if request.type == 'write':
+                        send(node_id, request.src, type='write_ok')
+                    elif request.type == 'cas':
+                        send(node_id, request.src, type='cas_ok')
                 else:
                     break 
         elif msg.body.term > currentTerm:

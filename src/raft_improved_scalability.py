@@ -33,6 +33,9 @@ linkv = {}
 
 read_log = {}
 
+number_reads = 0
+number_reads_response = 0
+
 state = None
 currentTerm = 0
 currentLeader = None
@@ -54,14 +57,14 @@ election_timeout = None
 read_quorum_timeout = None
 
 class Command:
-    def __init__(self, type, key, value, term, index, src, resp=1):
+    def __init__(self, type, key, value, term, index, src, client = None):
         self.type = type
         self.key = key
         self.value = value
         self.term = term
         self.index = index
         self.src = src
-        self.resp = resp
+        self.client = client
 
 def broadcast(**kwds):
     for i in node_ids:
@@ -179,14 +182,20 @@ def send_error(msg, code, text):
 
 def create_command(msg):
     global currentTerm, log, matchIndex
-    client = msg.src
-    if hasattr(msg.body, 'client'):
-        client = msg.body.client
+    #client = msg.src
+    #if hasattr(msg.body, 'client'):
+    #    client = msg.body.client
     index = len(log) + 1
     if msg.body.type == 'cas':
-        c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, client)
+        if hasattr(msg.body, 'client'):
+            c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, msg.src, msg.body.client)
+        else:
+            c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, msg.src)
     else:
-        c = Command('write', msg.body.key, msg.body.value, currentTerm, index, client)
+        if hasattr(msg.body, 'client'):
+            c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg.src, msg.body.client)
+        else:
+            c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg.src)
     log.append(c)       
     matchIndex[node_id] = index
 
@@ -201,13 +210,14 @@ def become_follower(msg):
     votedFor = None
     currentTerm = msg.body.term
     
-def send_read_quorum(msg, read_id):
+def send_read_quorum(msg, read_id, retries = 5):
     global read_log, read_quorum_timeout, node_ids, node_id
     read_id += 1
     #random selection approach
     all_possible_nodes = list(node_ids)
     all_possible_nodes.remove(node_id)
-    all_possible_nodes.remove(currentLeader)
+    if currentLeader != None:
+        all_possible_nodes.remove(currentLeader)
     quorum = random.sample(all_possible_nodes, (len(all_possible_nodes) // 2) + 1)
     if msg.body.key in linkv:
         read_log[read_id] = [msg.body.key, linkv[msg.body.key][0], linkv[msg.body.key][1], 1, msg.src]
@@ -216,8 +226,10 @@ def send_read_quorum(msg, read_id):
     for node in quorum:
         send(node_id, node, type='read_quorum', key=msg.body.key, read_id=read_id)
     logging.info('start read quorum timeout')
-    read_quorum_timeout = Timer(0.09, send_read_quorum, [msg, read_id])
-    read_quorum_timeout.start()
+    #Timer gets bigger with each retry
+    if retries > 0:
+        read_quorum_timeout = Timer(0.09 * (6 - retries), send_read_quorum, [msg, read_id, retries - 1])
+        read_quorum_timeout.start()
 
     
 for msg in receiveAll():
@@ -233,10 +245,13 @@ for msg in receiveAll():
         reply(msg, type='init_ok')
 
     elif msg.body.type == 'read':
+        number_reads += 1
         if state == State.LEADER:
             if msg.body.key in linkv:
                 logging.info('read %s', msg.body.key)
+                number_reads_response += 1
                 reply(msg, type='read_ok', value=linkv[msg.body.key][0])
+                logging.info('number of reads %s of %s', number_reads_response, number_reads)
 
             else:
                 send_error(msg, '20', 'Key not found')
@@ -274,6 +289,8 @@ for msg in receiveAll():
             if read_log[msg.body.read_id][3] == (len(node_ids)//2)+1:
                 if read_log[msg.body.read_id][1] != None:
                     read_quorum_timeout.cancel()
+                    number_reads_response += 1
+                    logging.info('number of reads %s of %s', number_reads_response, number_reads)
                     send(node_id, read_log[msg.body.read_id][4], type='read_ok', value=read_log[msg.body.read_id][1])
                 elif read_log[msg.body.read_id][2] == -1:
                     read_quorum_timeout.cancel()
@@ -295,16 +312,18 @@ for msg in receiveAll():
         logging.info('cas %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                if getattr(msg.body, "from") == linkv[msg.body.key][0]:
+                if (hasattr(msg.body, "from") and getattr(msg.body, "from") == linkv[msg.body.key]) or (hasattr(msg.body, "ffrom") and getattr(msg.body, "ffrom") == linkv[msg.body.key]): 
                     create_command(msg)
                 else:
+                    if hasattr(msg.body, "client"):
+                        msg.src = msg.body.client
                     send_error(msg, '22', 'From value does not match key')
                     logging.warning('from does not match value for key %s', msg.body.key)
             else:
+                if hasattr(msg.body, "client"):
+                    msg.src = msg.body.client
                 send_error(msg, '21', 'Key not found')
                 logging.warning('value not found for key %s', msg.body.key)
-        else:
-            send_error(msg, '11', 'Not leader')
 
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
@@ -325,15 +344,22 @@ for msg in receiveAll():
                     logging.info('matchIndex %s %s', node, matchIndex[node])
                     if matchIndex[node] >= request.index:
                         majority += 1
-                #request.resp += 1
                 #If there a majority of replicas responses, apply the command to the state machine
-                #if request.resp > (len(node_ids)//2):
                 if majority == (len(node_ids)//2) + 1:
                     logging.info('commit %s %s', request.key, request.value)
                     linkv[request.key] = (request.value, request.index)
                     lastApplied += 1
                     commitIndex += 1
-                    send(node_id, request.src, type='write_ok')
+                    if request.type == 'write':
+                        if request.client != None:
+                            send(node_id, request.src, type='write_ok', client=request.client)
+                        else:
+                            send(node_id, request.src, type='write_ok')
+                    elif request.type == 'cas':
+                        if request.client != None:
+                            send(node_id, request.src, type='cas_ok', client=request.client)
+                        else:
+                            send(node_id, request.src, type='cas_ok')
                 else:
                     break 
         elif msg.body.term > currentTerm:
@@ -378,3 +404,9 @@ for msg in receiveAll():
         elif msg.body.term > currentTerm:
             become_follower(msg)
             wait_for_heartbeat()
+
+    elif msg.body.type == 'write_ok':
+        send(node_id, msg.body.client, type='write_ok')
+
+    elif msg.body.type == 'cas_ok':
+        send(node_id, msg.body.client, type='cas_ok')
