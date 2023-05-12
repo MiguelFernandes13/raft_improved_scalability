@@ -1,20 +1,4 @@
 #!/usr/bin/env python
-
-# https://raft.github.io/raft.pdf
-
-#run with
-# ./maelstrom test --bin ../uni/4ano/sd/tf/raft_improved_scalability/src/raft_improved_scalability.py --time-limit 10 --node-count 4 -w lin-kv --concurrency 8n
-
-
-#Log replication
-#1.The leader appends the command to its log as a new entry
-#2.The leader sends AppendEntries RPCs to each of the other servers to replicate the entry
-#3.When the entry has been safely replicated, the leader increments commitIndex and applies the command to its state machine
-#4.Send response to client
-#5 If followers crash, leader retries AppendEntries RPCs indefinitely
-
-#Each log entry stores a state machine command along with the term
-#number when the entry was received by the leade
 import logging
 import random
 from threading import Thread, Timer, Lock
@@ -32,9 +16,6 @@ logging.getLogger().setLevel(logging.DEBUG)
 linkv = {}
 
 read_log = {}
-
-number_reads = 0
-number_reads_response = 0
 
 state = None
 currentTerm = 0
@@ -74,7 +55,6 @@ def broadcast(**kwds):
 def request_vote():
     global state, currentTerm, vote_count, votedFor, election_timeout, log
     if state != State.LEADER:
-        logging.info('request vote')
         state = State.CANDIDATE
         currentTerm += 1
         vote_count = 1
@@ -107,15 +87,12 @@ def send_heartbeat():
                 else:
                     prevLogIndex = nextIndex[i]
                     prevLogTerm = log[prevLogIndex - 1].term
-                logging.info('nextIndex: ' + str(nextIndex[i]) + ' len(log): ' + str(len(log)))
                 if nextIndex[i] < len(log):
-                    logging.info('sending log_replication with entries')
                     send(node_id, i, type='log_replication', term=currentTerm,
                             leader_id=node_id, prevLogIndex=prevLogIndex,
                             prevLogTerm = prevLogTerm, entries=log[nextIndex[i]:],
                             leadercommit=commitIndex)
                 else:
-                    logging.info('sending log_replication without entries')
                     send(node_id, i, type='log_replication', term=currentTerm, leader_id=node_id,
                             prevLogIndex=prevLogIndex, prevLogTerm = prevLogTerm, entries=[], leadercommit=commitIndex)
         time.sleep(0.07)
@@ -146,11 +123,8 @@ def verify_prevLogIndex(msg):
 def verify_heartbeat(msg):
     global commitIndex, log, state, heartbeat_timeout, election_timeout, currentTerm, votedFor, lastApplied
     if verify_term(msg):
-        logging.info('term verified')
-        
         wait_for_heartbeat()   
         if verify_prevLogIndex(msg):
-            logging.info('prevLogIndex verified')
             # If an existing entry conflicts with a new one (same index
             #but different terms), delete the existing entry and all that
             #follow it 
@@ -165,37 +139,35 @@ def verify_heartbeat(msg):
             #If leaderCommit > commitIndex, set commitIndex =
             #min(leaderCommit, index of last new entry)
             if msg.body.leadercommit > commitIndex:
-                logging.info('commitIndex updated from %s to %s', commitIndex, min(msg.body.leadercommit, len(log)))
                 commitIndex = min(msg.body.leadercommit, len(log))
                 for i in range(lastApplied, commitIndex ):
-                    logging.info('commit %s %s', log[i].key, log[i].value)
                     linkv[log[i].key] = (log[i].value, log[i].index)
                 lastApplied = commitIndex
             return True
     return False
 
 
-def send_error(msg, code, text):
+def send_error(msg, code, text, client=None):
     msg.body.code = code
     msg.body.text = text
-    reply(msg, type='error')
+    if client:
+        reply(msg, type='error', client=client)
+    else:
+        reply(msg, type='error')
 
 def create_command(msg):
     global currentTerm, log, matchIndex
-    #client = msg.src
-    #if hasattr(msg.body, 'client'):
-    #    client = msg.body.client
     index = len(log) + 1
     if msg.body.type == 'cas':
         if hasattr(msg.body, 'client'):
-            c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, msg.src, msg.body.client)
+            c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, msg, msg.body.client)
         else:
-            c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, msg.src)
+            c = Command('cas', msg.body.key, msg.body.to, currentTerm, index, msg)
     else:
         if hasattr(msg.body, 'client'):
-            c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg.src, msg.body.client)
+            c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg, msg.body.client)
         else:
-            c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg.src)
+            c = Command('write', msg.body.key, msg.body.value, currentTerm, index, msg)
     log.append(c)       
     matchIndex[node_id] = index
 
@@ -204,7 +176,6 @@ def become_follower(msg):
     if state != State.LEADER:
         heartbeat_timeout.cancel()
         if state == State.CANDIDATE:
-            logging.info('cancel election timeout')
             election_timeout.cancel()
     state = State.FOLLOWER
     votedFor = None
@@ -220,15 +191,14 @@ def send_read_quorum(msg, read_id, retries = 5):
         all_possible_nodes.remove(currentLeader)
     quorum = random.sample(all_possible_nodes, (len(all_possible_nodes) // 2) + 1)
     if msg.body.key in linkv:
-        read_log[read_id] = [msg.body.key, linkv[msg.body.key][0], linkv[msg.body.key][1], 1, msg.src]
+        read_log[read_id] = [msg.body.key, linkv[msg.body.key][0], linkv[msg.body.key][1], 1, msg]
     else:
-        read_log[read_id] = [msg.body.key, None, -1, 1, msg.src]
+        read_log[read_id] = [msg.body.key, None, -1, 1, msg]
     for node in quorum:
         send(node_id, node, type='read_quorum', key=msg.body.key, read_id=read_id)
-    logging.info('start read quorum timeout')
     #Timer gets bigger with each retry
     if retries > 0:
-        read_quorum_timeout = Timer(0.09 * (6 - retries), send_read_quorum, [msg, read_id, retries - 1])
+        read_quorum_timeout = Timer(0.07 * (6 - retries), send_read_quorum, [msg, read_id, retries - 1])
         read_quorum_timeout.start()
 
     
@@ -245,13 +215,10 @@ for msg in receiveAll():
         reply(msg, type='init_ok')
 
     elif msg.body.type == 'read':
-        number_reads += 1
+        logging.info('read %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                logging.info('read %s', msg.body.key)
-                number_reads_response += 1
                 reply(msg, type='read_ok', value=linkv[msg.body.key][0])
-                logging.info('number of reads %s of %s', number_reads_response, number_reads)
 
             else:
                 send_error(msg, '20', 'Key not found')
@@ -263,7 +230,6 @@ for msg in receiveAll():
         logging.info('read_quorum %s', msg.body.key)
         replied = False
         for entries in reversed(log[lastApplied:]):
-            logging.info('read_quorum %s %s', entries.key, entries.index)
             if entries.key == msg.body.key:
                 reply(msg, type='read_quorum_resp', sucess = True, timestamp=entries.index, read_id = msg.body.read_id)
                 replied = True
@@ -285,17 +251,13 @@ for msg in receiveAll():
                     else:
                         read_log[msg.body.read_id][1] = None
                     read_log[msg.body.read_id][2] = msg.body.timestamp
-            logging.info('read count %s', read_log[msg.body.read_id][3])
             if read_log[msg.body.read_id][3] == (len(node_ids)//2)+1:
                 if read_log[msg.body.read_id][1] != None:
                     read_quorum_timeout.cancel()
-                    number_reads_response += 1
-                    logging.info('number of reads %s of %s', number_reads_response, number_reads)
-                    send(node_id, read_log[msg.body.read_id][4], type='read_ok', value=read_log[msg.body.read_id][1])
+                    reply(read_log[msg.body.read_id][4], type='read_ok', value=read_log[msg.body.read_id][1])
                 elif read_log[msg.body.read_id][2] == -1:
                     read_quorum_timeout.cancel()
-                    msg.src = read_log[msg.body.read_id][4]
-                    send_error(msg, '20', 'Key not found')
+                    send_error(read_log[msg.body.read_id][4], '20', 'Key not found')
                 del read_log[msg.body.read_id]     
 
     elif msg.body.type == 'write':
@@ -304,7 +266,7 @@ for msg in receiveAll():
             create_command(msg)
         else:
             if currentLeader:
-                send(node_id, currentLeader, type='write', key=msg.body.key, value=msg.body.value, client=msg.src)
+                send(node_id, currentLeader, type='write', key=msg.body.key, value=msg.body.value, client=msg)
             else:
                 send_error(msg, '11', 'Not leader')
         
@@ -312,18 +274,26 @@ for msg in receiveAll():
         logging.info('cas %s', msg.body.key)
         if state == State.LEADER:
             if msg.body.key in linkv:
-                if (hasattr(msg.body, "from") and getattr(msg.body, "from") == linkv[msg.body.key]) or (hasattr(msg.body, "ffrom") and getattr(msg.body, "ffrom") == linkv[msg.body.key]): 
+                if (hasattr(msg.body, "from") and getattr(msg.body, "from") == linkv[msg.body.key][0]) or (hasattr(msg.body, "ffrom") and getattr(msg.body, "ffrom") == linkv[msg.body.key][0]):
                     create_command(msg)
                 else:
                     if hasattr(msg.body, "client"):
-                        msg.src = msg.body.client
-                    send_error(msg, '22', 'From value does not match key')
-                    logging.warning('from does not match value for key %s', msg.body.key)
+                        send_error(msg, '22', 'From value does not match key', client=msg.body.client)
+                    else:
+                        send_error(msg, '22', 'From value does not match key')
+                    logging.warning('from does not match value %s for key %s', msg.body.key, linkv[msg.body.key][0])
             else:
                 if hasattr(msg.body, "client"):
-                    msg.src = msg.body.client
-                send_error(msg, '21', 'Key not found')
+                    send_error(msg, '21', 'Key not found', client=msg.body.client)
+                else:
+                    send_error(msg, '21', 'Key not found')
                 logging.warning('value not found for key %s', msg.body.key)
+        else:
+            if currentLeader and hasattr(msg.body, "from"):
+                send(node_id, currentLeader, type='cas', key=msg.body.key, ffrom = getattr(msg.body, "from"), to=msg.body.to, client=msg)
+            else:
+                send_error(msg, '11', 'Not leader')
+
 
     elif msg.body.type == 'log_replication':
         logging.info('log replication')
@@ -341,25 +311,23 @@ for msg in receiveAll():
             for request in requests:
                 majority = 0
                 for node in node_ids:
-                    logging.info('matchIndex %s %s', node, matchIndex[node])
                     if matchIndex[node] >= request.index:
                         majority += 1
                 #If there a majority of replicas responses, apply the command to the state machine
                 if majority == (len(node_ids)//2) + 1:
-                    logging.info('commit %s %s', request.key, request.value)
                     linkv[request.key] = (request.value, request.index)
                     lastApplied += 1
                     commitIndex += 1
                     if request.type == 'write':
                         if request.client != None:
-                            send(node_id, request.src, type='write_ok', client=request.client)
+                            reply(request.src, type='write_ok', client=request.client)
                         else:
-                            send(node_id, request.src, type='write_ok')
+                            reply(request.src, type='write_ok')
                     elif request.type == 'cas':
                         if request.client != None:
-                            send(node_id, request.src, type='cas_ok', client=request.client)
+                            reply(request.src, type='cas_ok', client=request.client)
                         else:
-                            send(node_id, request.src, type='cas_ok')
+                            reply(request.src, type='cas_ok')
                 else:
                     break 
         elif msg.body.term > currentTerm:
@@ -406,7 +374,10 @@ for msg in receiveAll():
             wait_for_heartbeat()
 
     elif msg.body.type == 'write_ok':
-        send(node_id, msg.body.client, type='write_ok')
+        reply(msg.body.client, type='write_ok')
 
     elif msg.body.type == 'cas_ok':
-        send(node_id, msg.body.client, type='cas_ok')
+        reply(msg.body.client, type='cas_ok')
+
+    elif msg.body.type == 'error':
+        reply(msg.body.client, type='error')
